@@ -24,6 +24,7 @@ import {VERSION} from 'remotion/version';
 import * as headFileModule from '../../../../lambda-client/src/head-file';
 import * as readFileModule from '../../../../lambda-client/src/read-file';
 import * as writeFileModule from '../../../../lambda-client/src/write-file';
+import * as cleanupPropsModule from '../../functions/cleanup-props';
 import * as browserInstance from '../../functions/get-browser-instance';
 import {launchHandler} from '../../functions/handlers/launch';
 import {progressHandler} from '../../functions/handlers/progress';
@@ -88,6 +89,7 @@ const params: ServerlessPayloads['launch'] = {
 	forceDurationInFrames: null,
 	offthreadVideoCacheSizeInBytes: null,
 	offthreadVideoThreads: null,
+	preferredEffectBackend: 'auto',
 	mediaCacheSizeInBytes: null,
 	deleteAfter: null,
 	colorSpace: null,
@@ -301,6 +303,7 @@ const completedProgress = (): OverallRenderProgress => {
 		timeToCombine: 100,
 		timeToEncode: 100,
 		lambdasInvoked: 1,
+		rendererMemorySizeInMb: 2048,
 		retries: [],
 		postRenderData: null,
 		separateAudio: null,
@@ -317,10 +320,7 @@ const completedProgress = (): OverallRenderProgress => {
 	};
 };
 
-const invokeProgress = (
-	_fixture: ReturnType<typeof makeFixture>,
-	timeoutInMilliseconds = 120000,
-) =>
+const invokeProgress = (_fixture: ReturnType<typeof makeFixture>) =>
 	progressHandler({
 		params: {
 			type: ServerlessRoutines.status,
@@ -333,7 +333,6 @@ const invokeProgress = (
 		},
 		options: {
 			expectedBucketOwner: null,
-			timeoutInMilliseconds,
 			retriesRemaining: 0,
 		},
 	});
@@ -482,9 +481,11 @@ test.each(['normalized', 'constructed'] as const)(
 				? await getBundledHeadError(403)
 				: new OutputFileAccessDeniedError('Denied'),
 		);
-		fixture.setProgress(completedProgress());
 		for (const timeout of [120000, 1000]) {
-			const result = await invokeProgress(fixture, timeout);
+			const progress = completedProgress();
+			progress.timeoutTimestamp = progress.functionLaunched + timeout;
+			fixture.setProgress(progress);
+			const result = await invokeProgress(fixture);
 			expect(result.done).toBe(false);
 			expect(result.outputFile).toBeNull();
 			expect(result.framesRendered).toBe(20);
@@ -504,5 +505,56 @@ test('packaged status preserves unrelated storage failures and name-only lookali
 		const fixture = makeFixture(error);
 		fixture.setProgress(completedProgress());
 		await expect(invokeProgress(fixture)).rejects.toBe(error);
+	}
+});
+
+test('launch cleans up the serialized props when it is about to time out', async () => {
+	makeFixture(new Error('Not called with overwrite'));
+	const cleanup = spyOn(cleanupPropsModule, 'cleanupProps').mockResolvedValue([
+		0, 0,
+	]);
+	const select = spyOn(
+		RenderInternals,
+		'internalSelectComposition',
+	).mockResolvedValue({
+		metadata: {
+			id: 'comp',
+			width: 100,
+			height: 100,
+			fps: 30,
+			durationInFrames: 20,
+			props: {},
+		},
+	} as never);
+	const render = spyOn(
+		directRenderer,
+		'renderWithSingleFunction',
+	).mockImplementation(() => new Promise(() => undefined) as never);
+	try {
+		launchHandler({
+			params: {...params, overwrite: true},
+			options: {
+				expectedBucketOwner: null,
+				getRemainingTimeInMillis: () => 0,
+				requestContext: {
+					requestId: 'test',
+					expectedBucketOwner: null,
+					getRemainingTimeInMillis: () => 0,
+				},
+			},
+		});
+		const start = Date.now();
+		while (cleanup.mock.calls.length === 0 && Date.now() - start < 3000) {
+			await new Promise((resolve) => {
+				setTimeout(resolve, 50);
+			});
+		}
+
+		expect(render).toHaveBeenCalledTimes(1);
+		expect(cleanup).toHaveBeenCalledTimes(1);
+	} finally {
+		cleanup.mockRestore();
+		select.mockRestore();
+		render.mockRestore();
 	}
 });
